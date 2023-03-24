@@ -1,209 +1,307 @@
 package main
 
 import (
-	"bufio"
+	"bitbucket.org/ai69/popua"
+	"bytes"
 	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"log"
-	"math"
+	"github.com/bzssm/goclub/logger"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"io"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
-type schoolInfo struct {
-	Data map[string]schoolInfoData `json:"data"`
-}
-
-type schoolInfoData struct {
-	Name string `json:"school_name"`
-}
-
-// specific schema
-
-type specificInfo struct {
-	Data *specificInfoData `json:"data"`
-}
-
-type specificInfoData struct {
-	Num  int             `json:"numFound"`
-	Item []*specificItem `json:"item"`
-}
-
-type specificItem struct {
-	Name       string `json:"spname"`
-	SpeType    string `json:"zslx_name"`
-	Batch      string `json:"local_batch_name"`
-	Min        string `json:"min"`
-	MinSection string `json:"min_section"`
-	Max        string `json:"max"`
-	Avg        string `json:"average"`
-}
-
-// specific result schema
-
-type spResult struct {
-	School   schoolInfoData
-	Year     int
-	Specific *specificInfo
-}
-
-// year, school id, index
-const specificURLPattern = "https://static-data.gaokao.cn/www/2.0/schoolplanindex/%v/%v/45/1/7/%v.json"
-
-//const specificURLPattern = "https://static-data.gaokao.cn/www/2.0/schoolspecialindex/%v/%v/45/1/7/%v.json"
-
 var (
-	concurrency = flag.Int("f", 20, "concurrency")
+	log        *zap.SugaredLogger
+	debug      = true
+	parallel   = 200
+	chanBuffer = 500
+
+	schools         []schoolData
+	schoolIDNameMap = make(map[string]string, 0)
+
+	schoolInfoFailed = &atomic.Int64{}
+	schoolPTBFailed  = &atomic.Int64{}
+)
+
+// ptb stands for provice id, type id, batch id
+const (
+	schoolListURL  = "https://static-data.gaokao.cn/www/2.0/school/name.json"
+	schoolListFile = "school_list.json"
+
+	schoolInfoURLFormat = "https://static-data.gaokao.cn/www/2.0/school/%v/info.json"
+	schoolInfoDir       = "school_info"
+	schoolInfoRawDir    = "RAW_school_info"
+
+	schoolPTBURLFormat = "https://static-data.gaokao.cn/www/2.0/school/%v/dic/provincescore.json"
+	schoolPTBRawDir    = "school_ptb"
+
+	// year, school id, province id, type, batch, index
+	specialDetailURLFormat = "https://static-data.gaokao.cn/www/2.0/schoolspecialindex/%v/%v/%v/%v/%v/%v.json"
 )
 
 func main() {
-	flag.Parse()
-	// get school list first
-	url := "https://static-gkcx.gaokao.cn/www/2.0/json/live/v2/schoolnum.json"
-	resp, err := http.Get(url)
+	lgr, _, _ := logger.InitLogger(zapcore.InfoLevel, true, "")
+	log = lgr
+	// stat
+	defer func() {
+		log.Infof("school info failed : %v", schoolInfoFailed.Load())
+		log.Infof("school ptb failed  : %v", schoolPTBFailed.Load())
+	}()
+	// 1. get school list from: https://static-data.gaokao.cn/www/2.0/school/name.json
+	content, err := request(schoolListURL, true)
 	if err != nil {
-		log.Fatalf("get school list failed, err is :%v", err)
+		os.Exit(1)
 	}
-	var schools schoolInfo
-	info, _ := ioutil.ReadAll(resp.Body)
-	err = json.Unmarshal(info, &schools)
+	// 1.1 write raw content to file
+	if err := os.WriteFile("RAW_"+schoolListFile, content, 0666); err != nil {
+		log.Fatalw("write school list raw failed", zap.Error(err))
+	}
+	// 1.2 load school info
+	var schoolJSON school
+	if err := json.Unmarshal(content, &schoolJSON); err != nil {
+		log.Fatalw("unmarshal school list failed", zap.Error(err))
+	}
+	schools = schoolJSON.Data
+	log.Info(schools[0].Name)
+	// 1.3 save to file
+	if content, err = json.MarshalIndent(schoolJSON, "", "  "); err != nil {
+		log.Fatalw("marshal school list failed", zap.Error(err))
+	}
+	if err := os.WriteFile(schoolListFile, content, 0666); err != nil {
+		log.Fatalw("write school list failed", zap.Error(err))
+	}
+	// 1.4 load school id -> name map
+	for _, sc := range schools {
+		schoolIDNameMap[sc.SchoolID] = sc.Name
+	}
+	log.Infow("school list loaded", zap.Int("school num", len(schools))) // should be 2827
+
+	// 2. parallel get school info
+	// 2.0 init
+	mkdir(schoolInfoDir)
+	mkdir(schoolInfoRawDir)
+	schoolInfoIDCh := make(chan string, chanBuffer)
+	wg := &sync.WaitGroup{}
+	// 2.1 start worker
+	for i := 0; i < parallel; i++ {
+		wg.Add(1)
+		go schoolInfoWorker(schoolInfoIDCh, wg)
+	}
+	// 2.2 producer, send data
+	for index, school := range schools {
+		if debug && index > 50 {
+			break
+		}
+		schoolInfoIDCh <- school.SchoolID
+		if index%100 == 0 {
+			log.Infof("%v/%v school info have been processed", index, len(schools))
+		}
+	}
+	close(schoolInfoIDCh)
+	wg.Wait()
+
+	// 3. parallel read province score: get year/type/batch group
+	// 3.0 init
+	mkdir(schoolPTBRawDir)
+	schoolPTBIDCh := make(chan string, chanBuffer)
+	schoolPTBCollectorCh := make(chan string, chanBuffer)
+	collectorWG := &sync.WaitGroup{}
+	// 3.1 start collector
+	collectorWG.Add(1)
+	go schoolPTBCollector(schoolPTBCollectorCh, collectorWG)
+	// 3.2 start worker
+	for i := 0; i < parallel; i++ {
+		wg.Add(1)
+		go schoolPTBWorker(schoolPTBIDCh, schoolPTBCollectorCh, wg)
+	}
+	// 3.3 producer
+	for index, school := range schools {
+		if debug && index > 50 {
+			break
+		}
+		schoolPTBIDCh <- school.SchoolID
+		if index%100 == 0 {
+			log.Infof("%v/%v school ptb have been processed", index, len(schools))
+		}
+	}
+	close(schoolPTBIDCh)
+	wg.Wait()
+	close(schoolPTBCollectorCh)
+	collectorWG.Wait()
+
+	//// 4. detail
+	//// have to read from file.
+	//// [year,school,province] -> [[type,batch], [type,batch]...]
+	//detailDistributionMap := make(map[[3]string][2]string)
+	//// when generate, generate by year-school-province group
+
+}
+
+func specialDetailWorker(idCh chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for id := range idCh {
+		fields := strings.Split(id, ",")
+		// year, school id, province id, type, batch, index
+		url := fmt.Sprintf(specialDetailURLFormat, fields[0], fields[1], fields[2], fields[3], fields[4], 1)
+		resp, err := http.Get(url)
+		if err != nil {
+			fmt.Printf("url: %v, download error: %v\n", id, err)
+			continue
+		}
+		if resp.StatusCode != 200 {
+			fmt.Printf("id: %v, status error: %v\n", id, resp.StatusCode)
+			continue
+		}
+		fileContent := &bytes.Buffer{}
+		content, _ := io.ReadAll(resp.Body)
+		if err := json.Indent(fileContent, content, "", "  "); err != nil {
+			fmt.Println(err)
+		}
+		os.WriteFile(fmt.Sprintf("school_detail/%v.json", id), fileContent.Bytes(), 0777)
+	}
+}
+
+func schoolPTBCollector(collectorCh chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	f, err := os.OpenFile("ptb.txt", os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
-		log.Fatalf("unmarshal school info failed, err is :%v", err)
+		panic(err)
 	}
+	defer f.Close()
+	for record := range collectorCh {
+		_, err := f.WriteString(record + "\n")
+		if err != nil {
+			panic(err)
+		}
+	}
+}
 
-	// get special info consumer, generate every school's all specific list for all years
-	// send school id only
-	urlSendCh := make(chan int, *concurrency)
-	// res coll ch
-	resCh := make(chan spResult, 20)
-
-	wg := sync.WaitGroup{}
-	wg.Add(*concurrency)
-	for i := 0; i < *concurrency; i++ {
-		go func() {
-			defer wg.Done()
-			for schoolID := range urlSendCh {
-				// get 1st page
-			INNER:
-				for year := 2017; year <= 2022; year++ {
-					sURL := fmt.Sprintf(specificURLPattern, year, schoolID, 1)
-					specInfo, err := getSchoolSpecInfo(sURL)
-					if err != nil || specInfo == nil {
-						//log.Printf("get spec info failed, url: %v, err: %v", sURL, err)
-						if err != nil {
-							log.Printf("err get spec info, school id: %v, year: %v, err: %v", schoolID, year, err)
-						}
-						continue INNER
-					}
-					// add to result
-					res := spResult{
-						School:   schools.Data[strconv.Itoa(schoolID)],
-						Year:     year,
-						Specific: &specificInfo{Data: &specificInfoData{Item: make([]*specificItem, 0)}},
-					}
-					// use second way to get school name
-					if res.School.Name == "" {
-						sn, err := getSchoolInfo(schoolID)
-						if err != nil {
-							log.Printf("get school name failed, err : %v, id: %v", err, schoolID)
-						}
-						res.School.Name = sn
-					}
-					if res.School.Name == "" {
-						res.School.Name = fmt.Sprintf("%v", schoolID)
-					}
-					res.Year = year
-					res.Specific.Data.Item = append(res.Specific.Data.Item, specInfo.Data.Item...)
-					if pages := int(math.Ceil(float64(specInfo.Data.Num) / 10)); pages > 1 {
-						for page := 2; page <= pages; page++ {
-							sURL := fmt.Sprintf(specificURLPattern, year, schoolID, page)
-							specInfo, err := getSchoolSpecInfo(sURL)
-							if err != nil {
-								log.Printf("get spec info failed, url: %v, err: %v", sURL, err)
-								continue INNER
-							}
-							res.Specific.Data.Item = append(res.Specific.Data.Item, specInfo.Data.Item...)
-						}
-					}
-					// send year data to res ch
-					resCh <- res
+func schoolPTBWorker(idCh, collectorCh chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for id := range idCh {
+		content, err := request(fmt.Sprintf(schoolPTBURLFormat, id), false)
+		if err != nil {
+			schoolPTBFailed.Add(1)
+			continue
+		}
+		// write raw content
+		if err := os.WriteFile(path.Join(schoolPTBRawDir, fmt.Sprintf("%v_%v.json", id, schoolIDNameMap[id])), content, 0666); err != nil {
+			log.Fatalw("write school ptb raw failed", zap.Error(err))
+		}
+		// load school info
+		var schoolPTB ptb
+		if err := json.Unmarshal(content, &schoolPTB); err != nil {
+			log.Fatalw("unmarshal school ptb failed", zap.Error(err), zap.String("id", id))
+		}
+		// generate year, school, province,
+		for _, yearData := range schoolPTB.Data.Data {
+			for _, provinceData := range yearData.Province {
+				for _, tb := range combination(provinceData.Type, provinceData.Batch) {
+					collectorCh <- fmt.Sprintf("%v,%v,%v,%v,%v", yearData.Year, mustToInt(id), provinceData.Pid, tb[0], tb[1])
 				}
 			}
-		}()
-	}
-
-	// result ch
-	resWg := sync.WaitGroup{}
-	resWg.Add(1)
-	go func() {
-		defer resWg.Done()
-		f, _ := os.OpenFile("./result.json", os.O_CREATE|os.O_RDWR, 0666)
-		w := bufio.NewWriter(f)
-		defer w.Flush()
-		for res := range resCh {
-			byt, err := json.Marshal(res)
-			if err != nil {
-				log.Fatal(err)
-			}
-			_, err = w.Write(byt)
-			if err != nil {
-				log.Fatal(err)
-			}
-			w.Write([]byte("\n"))
 		}
-	}()
-	// producer ch
-	log.Printf("total count: %v", 10000)
-	i := 0
-	for k := 0; k <= 5000; k++ {
-		urlSendCh <- k
-		i++
-		log.Printf("%v schools produced", i)
 	}
-	close(urlSendCh)
-	wg.Wait()
-	close(resCh)
-	resWg.Wait()
 }
 
-func getSchoolSpecInfo(url string) (*specificInfo, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
+func schoolInfoWorker(idCh chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for id := range idCh {
+		content, err := request(fmt.Sprintf(schoolInfoURLFormat, id), true)
+		if err != nil {
+			schoolInfoFailed.Add(1)
+			continue
+		}
+		// write raw content
+		if err := os.WriteFile(path.Join(schoolInfoRawDir, fmt.Sprintf("%v_%v.json", id, schoolIDNameMap[id])), content, 0666); err != nil {
+			log.Fatalw("write school list raw failed", zap.Error(err))
+		}
+		// load school info
+		var schoolInfoJSON info
+		if err := json.Unmarshal(content, &schoolInfoJSON); err != nil {
+			log.Fatalw("unmarshal school info failed", zap.Error(err), zap.String("id", id))
+		}
+		// write to file
+		if content, err = json.MarshalIndent(schoolInfoJSON, "", "  "); err != nil {
+			log.Fatalw("marshal school info failed", zap.Error(err), zap.String("id", id))
+		}
+		if err := os.WriteFile(path.Join(schoolInfoDir, fmt.Sprintf("%v_%v.json", id, schoolIDNameMap[id])), content, 0666); err != nil {
+			log.Fatalw("write school info failed", zap.Error(err), zap.String("id", id))
+		}
 	}
-	var specific specificInfo
-	info, _ := ioutil.ReadAll(resp.Body)
-	if len(info) < 10 {
-		return nil, nil
-	}
-	err = json.Unmarshal(info, &specific)
-	if err != nil {
-		return nil, err
-	}
-	return &specific, nil
 }
 
-func getSchoolInfo(id int) (string, error) {
-	resp, err := http.Get(fmt.Sprintf("https://static-data.gaokao.cn/www/2.0/school/%v/info.json", id))
+func request(url string, checkStatus bool) ([]byte, error) {
+	client := &http.Client{}
+	ua := popua.GetWeightedRandom()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return "", err
+		log.Errorw("http request build failed", zap.Error(err), zap.String("url", url))
+		return nil, err
 	}
-	var specific struct {
-		Data struct {
-			Name string `json:"name"`
-		} `json:"data"`
-	}
-	info, _ := ioutil.ReadAll(resp.Body)
-	if len(info) < 10 {
-		return "", nil
-	}
-	err = json.Unmarshal(info, &specific)
+	req.Header.Set("User-Agent", ua)
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		log.Errorw("http request send failed", zap.Error(err), zap.String("url", url))
+		return nil, err
 	}
-	return specific.Data.Name, nil
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		if checkStatus {
+			log.Errorw("http response code check failed", zap.Int("status", resp.StatusCode), zap.String("url", url))
+		}
+		return nil, errors.New("check http status code failed")
+	}
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Errorw("load resp body failed", zap.Error(err), zap.String("url", url))
+		return nil, err
+	}
+	return content, err
+}
+
+func combination(a, b []int) [][2]int {
+	res := make([][2]int, 0, len(a)*len(b))
+	for _, a1 := range a {
+		for _, b1 := range b {
+			res = append(res, [2]int{a1, b1})
+		}
+	}
+	return res
+}
+
+func mustToInt(s string) int {
+	i, e := strconv.Atoi(s)
+	if e != nil {
+		panic(e)
+	}
+	return i
+}
+
+func must(err error) {
+	if err != nil {
+		log.Panic(err)
+	}
+}
+
+func mkdir(path string) {
+	_, err := os.Stat(path)
+	if err == nil {
+		// already exists
+		return
+	}
+	if os.IsNotExist(err) {
+		must(os.Mkdir(path, 0777))
+		return
+	}
+	panic(err)
 }
