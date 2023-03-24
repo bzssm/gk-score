@@ -145,7 +145,7 @@ func main() {
 	// 4. detail
 	// have to read from file. should be 433381 lines
 	// [year,school,province] -> [[type,batch], [type,batch]...]
-	detailDistributionMap := make(map[[3]string][][2]string)
+	detailDistributionMap := make(map[[2]string][][3]string)
 	// when generate, generate by year-school-province group
 	ptbFile, err := os.Open(schoolPTBFile)
 	if err != nil {
@@ -156,12 +156,11 @@ func main() {
 	for scanner.Scan() {
 		// year, school, prov, type, batch
 		fields := strings.Split(scanner.Text(), ",")
-		log.Info(fields)
-		key := [3]string{fields[0], fields[1], fields[2]}
+		key := [2]string{fields[0], fields[1]}
 		if v, ok := detailDistributionMap[key]; ok {
-			v = append(v, [2]string{fields[3], fields[4]})
+			v = append(v, [3]string{fields[2], fields[3], fields[4]})
 		} else {
-			v = [][2]string{{fields[3], fields[4]}}
+			v = [][3]string{{fields[2], fields[3], fields[4]}}
 			detailDistributionMap[key] = v
 		}
 	}
