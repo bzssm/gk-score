@@ -23,6 +23,7 @@ import (
 var (
 	log        *zap.SugaredLogger
 	debug      = true
+	debugCount = 20
 	parallel   = 200
 	chanBuffer = 500
 
@@ -100,7 +101,7 @@ func main() {
 	}
 	// 2.2 producer, send data
 	for index, school := range schools {
-		if debug && index > 50 {
+		if debug && index > debugCount {
 			break
 		}
 		schoolInfoIDCh <- school.SchoolID
@@ -127,7 +128,7 @@ func main() {
 	}
 	// 3.3 producer
 	for index, school := range schools {
-		if debug && index > 50 {
+		if debug && index > debugCount {
 			break
 		}
 		schoolPTBIDCh <- school.SchoolID
@@ -150,15 +151,18 @@ func main() {
 	if err != nil {
 		log.Fatalw("open ptb list failed", zap.Error(err))
 	}
+	defer ptbFile.Close()
 	scanner := bufio.NewScanner(ptbFile)
 	for scanner.Scan() {
 		// year, school, prov, type, batch
 		fields := strings.Split(scanner.Text(), ",")
+		log.Info(fields)
 		key := [3]string{fields[0], fields[1], fields[2]}
 		if v, ok := detailDistributionMap[key]; ok {
 			v = append(v, [2]string{fields[3], fields[4]})
 		} else {
 			v = [][2]string{{fields[3], fields[4]}}
+			detailDistributionMap[key] = v
 		}
 	}
 	log.Infof("detail group: %v", len(detailDistributionMap))
@@ -190,13 +194,22 @@ func specialDetailWorker(idCh chan string, wg *sync.WaitGroup) {
 
 func schoolPTBCollector(collectorCh chan string, wg *sync.WaitGroup) {
 	defer wg.Done()
-	f, err := os.OpenFile(schoolPTBFile, os.O_CREATE|os.O_RDWR, 0666)
+	f, err := os.OpenFile(schoolPTBFile, os.O_CREATE|os.O_RDWR|os.O_RDWR, 0666)
 	if err != nil {
 		panic(err)
 	}
-	defer f.Close()
+	defer func() {
+		must(f.Close())
+	}()
+	writer := bufio.NewWriter(f)
+	defer func() {
+		writer.Flush()
+	}()
 	for record := range collectorCh {
-		_, err := f.WriteString(record + "\n")
+		if len(record) <= 10 {
+			panic(record)
+		}
+		_, err := writer.WriteString(record + "\n")
 		if err != nil {
 			panic(err)
 		}
