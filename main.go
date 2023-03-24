@@ -3,7 +3,6 @@ package main
 import (
 	"bitbucket.org/ai69/popua"
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -23,15 +23,17 @@ import (
 var (
 	log        *zap.SugaredLogger
 	debug      = true
-	debugCount = 20
+	debugCount = 3000
 	parallel   = 200
 	chanBuffer = 500
 
 	schools         []schoolData
 	schoolIDNameMap = make(map[string]string, 0)
 
-	schoolInfoFailed = &atomic.Int64{}
-	schoolPTBFailed  = &atomic.Int64{}
+	schoolInfoFailed    = &atomic.Int64{}
+	schoolPTBFailed     = &atomic.Int64{}
+	specialDetailFailed = &atomic.Int64{}
+	specialDetailTotal  = &atomic.Int64{}
 )
 
 // ptb stands for provice id, type id, batch id
@@ -49,6 +51,7 @@ const (
 
 	// year, school id, province id, type, batch, index
 	specialDetailURLFormat = "https://static-data.gaokao.cn/www/2.0/schoolspecialindex/%v/%v/%v/%v/%v/%v.json"
+	specialDetailDir       = "special_detail"
 )
 
 func main() {
@@ -56,8 +59,10 @@ func main() {
 	log = lgr
 	// stat
 	defer func() {
-		log.Infof("school info failed : %v", schoolInfoFailed.Load())
-		log.Infof("school ptb failed  : %v", schoolPTBFailed.Load())
+		log.Infof("school info failed    : %v", schoolInfoFailed.Load())
+		log.Infof("school ptb failed     : %v", schoolPTBFailed.Load())
+		log.Infof("special detail total  : %v", specialDetailTotal.Load())
+		log.Infof("special detail failed : %v", specialDetailFailed.Load())
 	}()
 	// 1. get school list from: https://static-data.gaokao.cn/www/2.0/school/name.json
 	content, err := request(schoolListURL, true)
@@ -144,9 +149,11 @@ func main() {
 
 	// 4. detail
 	// have to read from file. should be 433381 lines
-	// [year,school,province] -> [[type,batch], [type,batch]...]
+	// [school,province] -> [[year,type,batch], [year,type,batch]...]
+	// if key = year, school, province: 215541 groups -> too many files
+	// if key = year, school: 13272 groups -> too less concurrency
+	// key = school, prov: 49606 groups
 	detailDistributionMap := make(map[[2]string][][3]string)
-	// when generate, generate by year-school-province group
 	ptbFile, err := os.Open(schoolPTBFile)
 	if err != nil {
 		log.Fatalw("open ptb list failed", zap.Error(err))
@@ -156,7 +163,7 @@ func main() {
 	for scanner.Scan() {
 		// year, school, prov, type, batch
 		fields := strings.Split(scanner.Text(), ",")
-		key := [2]string{fields[2], fields[1]}
+		key := [2]string{fields[1], fields[2]}
 		if v, ok := detailDistributionMap[key]; ok {
 			v = append(v, [3]string{fields[0], fields[3], fields[4]})
 		} else {
@@ -164,31 +171,121 @@ func main() {
 			detailDistributionMap[key] = v
 		}
 	}
-	log.Infof("detail group: %v", len(detailDistributionMap))
+	// Check
+	for _, v := range detailDistributionMap {
+		if len(v) > 1 {
+			log.Info(v) //竟然没有一个多的？？？
+		}
+	}
+	os.Exit(1)
+	// 4.1 init
+	reqCh := make(chan detailGroup, chanBuffer)
+	collectorCh := make(chan SchoolProv, chanBuffer)
+	mkdir(specialDetailDir)
+	// 4.2 start collector
+	collectorWG.Add(1)
+	go specialDetailCollector(collectorCh, collectorWG)
+	// 4.3 start worker
+	for i := 0; i < parallel; i++ {
+		wg.Add(1)
+		go specialDetailWorker(reqCh, collectorCh, wg)
+	}
+	// 4.4 producer
+	index := 0
+	for k, v := range detailDistributionMap {
+		reqCh <- detailGroup{
+			Key:   k,
+			Value: v,
+		}
+		if index%100 == 0 {
+			log.Infof("%v/%v special group have been processed", index, len(detailDistributionMap))
+		}
+		index++
+	}
+	close(reqCh)
+	wg.Wait()
+	close(collectorCh)
+	collectorWG.Wait()
 }
 
-func specialDetailWorker(idCh chan string, wg *sync.WaitGroup) {
+func specialDetailCollector(dataCh chan SchoolProv, wg *sync.WaitGroup) {
 	defer wg.Done()
-	for id := range idCh {
-		fields := strings.Split(id, ",")
-		// year, school id, province id, type, batch, index
-		url := fmt.Sprintf(specialDetailURLFormat, fields[0], fields[1], fields[2], fields[3], fields[4], 1)
-		resp, err := http.Get(url)
+	for schoolProv := range dataCh {
+		if len(schoolProv.YTBSpecials) > 1 {
+			log.Info("ytbspecial > 1", schoolProv.SchoolID, schoolProv.ProvinceID)
+		}
+		content, err := json.MarshalIndent(schoolProv, "", "  ")
 		if err != nil {
-			fmt.Printf("url: %v, download error: %v\n", id, err)
+			log.Errorw("marshal special detail failed",
+				zap.Error(err),
+				zap.String("school", schoolProv.SchoolID),
+				zap.String("prov", schoolProv.ProvinceID))
 			continue
 		}
-		if resp.StatusCode != 200 {
-			fmt.Printf("id: %v, status error: %v\n", id, resp.StatusCode)
+		file, err := os.OpenFile(path.Join(specialDetailDir, fmt.Sprintf("%v_%v.json", schoolProv.SchoolID, schoolProv.ProvinceID)), os.O_CREATE|os.O_RDWR, 0666)
+		if _, err := file.Write(content); err != nil {
+			log.Errorw("write special detail file failed", zap.String("file", file.Name()))
 			continue
 		}
-		fileContent := &bytes.Buffer{}
-		content, _ := io.ReadAll(resp.Body)
-		if err := json.Indent(fileContent, content, "", "  "); err != nil {
-			fmt.Println(err)
-		}
-		os.WriteFile(fmt.Sprintf("school_detail/%v.json", id), fileContent.Bytes(), 0777)
 	}
+}
+
+// group: [[school, prov] -> [y,t,b], [y,t,b]]
+func specialDetailWorker(groupCh chan detailGroup, collectorCh chan SchoolProv, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for group := range groupCh {
+		ytbSpecials := make([]YTBSpecial, 0)
+		// year, type, batch
+		for _, oneYTBData := range group.Value {
+			specialDetailTotal.Add(1)
+			specials := getSpecialDetailByPage(oneYTBData[0], group.Key[0], group.Key[1], oneYTBData[1], oneYTBData[2])
+			if specials == nil || len(specials) == 0 {
+				specialDetailFailed.Add(1)
+				continue
+			}
+			ytbSpecials = append(ytbSpecials, YTBSpecial{
+				Year:    oneYTBData[0],
+				Typ:     oneYTBData[1],
+				Batch:   oneYTBData[2],
+				Special: specials,
+			})
+		}
+		if len(ytbSpecials) != 0 {
+			collectorCh <- SchoolProv{
+				SchoolID:    group.Key[0],
+				ProvinceID:  group.Key[1],
+				YTBSpecials: ytbSpecials,
+			}
+		}
+	}
+}
+
+func getSpecialDetailByPage(year, school, prov, typ, batch string) []Special {
+	firstPageURL := fmt.Sprintf(specialDetailURLFormat, year, school, prov, typ, batch, 1)
+	content, err := request(firstPageURL, false)
+	if err != nil {
+		return nil
+	}
+	var ss SchoolSpecial
+	if err := json.Unmarshal(content, &ss); err != nil {
+		log.Error("unmarshal school special failed.", err, year, school, prov, typ, batch)
+		return nil
+	}
+	res := make([]Special, 0, ss.Data.NumFound)
+	// add page 1 data
+	res = append(res, ss.Data.Item...)
+	for page := 2; page < int(math.Ceil(float64(ss.Data.NumFound)/10)); page++ {
+		content, err = request(firstPageURL, false)
+		if err != nil {
+			continue
+		}
+		if err := json.Unmarshal(content, &ss); err != nil {
+			log.Error("unmarshal school special failed.", err, year, school, prov, typ, batch, page)
+			continue
+		}
+		res = append(res, ss.Data.Item...)
+	}
+	return res
 }
 
 func schoolPTBCollector(collectorCh chan string, wg *sync.WaitGroup) {

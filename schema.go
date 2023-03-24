@@ -1,5 +1,7 @@
 package main
 
+import "fmt"
+
 type school struct {
 	Data []schoolData `json:"data"`
 }
@@ -68,4 +70,68 @@ type ptb struct {
 			} `json:"province"`
 		} `json:"data"`
 	} `json:"data"`
+}
+
+type detailGroup struct {
+	Key   [2]string   // [school, prov]
+	Value [][3]string // [[year, type, batch]....]
+}
+
+func (g *detailGroup) String() string {
+	return fmt.Sprintf("year: %v, school: %v, province: %v, type: %v, batch: %v", g.Value[0], g.Key[0], g.Key[1], g.Value[1], g.Value[2])
+}
+
+type SchoolSpecial struct {
+	Data struct {
+		NumFound int       `json:"numFound"`
+		Item     []Special `json:"item"`
+	} `json:"data"`
+}
+
+type YTBSpecial struct {
+	Year    string
+	Typ     string
+	Batch   string
+	Special []Special
+}
+
+type Special struct {
+	SchoolID       string `json:"school_id"`
+	SpecialID      string `json:"special_id"`
+	Type           string `json:"type"`
+	Batch          string `json:"batch"`
+	Zslx           string `json:"zslx"`
+	Max            string `json:"max"`
+	Min            string `json:"min"`
+	Average        string `json:"average"`
+	MinSection     string `json:"min_section"`
+	Province       string `json:"province"`
+	SpeID          string `json:"spe_id"`
+	Info           string `json:"info"`
+	SpecialGroup   string `json:"special_group"`
+	FirstKm        string `json:"first_km"`
+	SpType         string `json:"sp_type"`
+	SpFxk          string `json:"sp_fxk"`
+	SpSxk          string `json:"sp_sxk"`
+	SpInfo         string `json:"sp_info"`
+	Level1Name     string `json:"level1_name"`
+	Level2Name     string `json:"level2_name"`
+	Level3Name     string `json:"level3_name"`
+	Level1         string `json:"level1"`
+	Level2         string `json:"level2"`
+	Level3         string `json:"level3"`
+	Spname         string `json:"spname"`
+	ZslxName       string `json:"zslx_name"`
+	LocalBatchName string `json:"local_batch_name"`
+	SgFxk          string `json:"sg_fxk"`
+	SgSxk          string `json:"sg_sxk"`
+	SgType         string `json:"sg_type"`
+	SgName         string `json:"sg_name"`
+	SgInfo         string `json:"sg_info"`
+}
+
+type SchoolProv struct {
+	SchoolID    string
+	ProvinceID  string
+	YTBSpecials []YTBSpecial
 }
