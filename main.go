@@ -1,14 +1,10 @@
 package main
 
 import (
-	"bitbucket.org/ai69/popua"
 	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/bzssm/goclub/logger"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"io"
 	"math"
 	"net/http"
@@ -18,12 +14,17 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"bitbucket.org/ai69/popua"
+	"github.com/bzssm/goclub/logger"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 var (
 	log        *zap.SugaredLogger
 	debug      = true
-	debugCount = 3000
+	debugCount = 100
 	parallel   = 200
 	chanBuffer = 500
 
@@ -165,19 +166,12 @@ func main() {
 		fields := strings.Split(scanner.Text(), ",")
 		key := [2]string{fields[1], fields[2]}
 		if v, ok := detailDistributionMap[key]; ok {
-			v = append(v, [3]string{fields[0], fields[3], fields[4]})
+			detailDistributionMap[key] = append(v, [3]string{fields[0], fields[3], fields[4]})
 		} else {
 			v = [][3]string{{fields[0], fields[3], fields[4]}}
 			detailDistributionMap[key] = v
 		}
 	}
-	// Check
-	for _, v := range detailDistributionMap {
-		if len(v) > 1 {
-			log.Info(v) //竟然没有一个多的？？？
-		}
-	}
-	os.Exit(1)
 	// 4.1 init
 	reqCh := make(chan detailGroup, chanBuffer)
 	collectorCh := make(chan SchoolProv, chanBuffer)
@@ -206,14 +200,13 @@ func main() {
 	wg.Wait()
 	close(collectorCh)
 	collectorWG.Wait()
+
+	// 5. zip
 }
 
 func specialDetailCollector(dataCh chan SchoolProv, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for schoolProv := range dataCh {
-		if len(schoolProv.YTBSpecials) > 1 {
-			log.Info("ytbspecial > 1", schoolProv.SchoolID, schoolProv.ProvinceID)
-		}
 		content, err := json.MarshalIndent(schoolProv, "", "  ")
 		if err != nil {
 			log.Errorw("marshal special detail failed",
@@ -274,8 +267,9 @@ func getSpecialDetailByPage(year, school, prov, typ, batch string) []Special {
 	res := make([]Special, 0, ss.Data.NumFound)
 	// add page 1 data
 	res = append(res, ss.Data.Item...)
-	for page := 2; page < int(math.Ceil(float64(ss.Data.NumFound)/10)); page++ {
-		content, err = request(firstPageURL, false)
+	for page := 2; page <= int(math.Ceil(float64(ss.Data.NumFound)/10)); page++ {
+		url := fmt.Sprintf(specialDetailURLFormat, year, school, prov, typ, batch, page)
+		content, err = request(url, false)
 		if err != nil {
 			continue
 		}

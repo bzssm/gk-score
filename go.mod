@@ -1,4 +1,4 @@
-module awesomeProject
+module gk-score
 
 go 1.18
 
