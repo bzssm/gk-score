@@ -156,11 +156,11 @@ func main() {
 	for scanner.Scan() {
 		// year, school, prov, type, batch
 		fields := strings.Split(scanner.Text(), ",")
-		key := [2]string{fields[0], fields[1]}
+		key := [2]string{fields[2], fields[1]}
 		if v, ok := detailDistributionMap[key]; ok {
-			v = append(v, [3]string{fields[2], fields[3], fields[4]})
+			v = append(v, [3]string{fields[0], fields[3], fields[4]})
 		} else {
-			v = [][3]string{{fields[2], fields[3], fields[4]}}
+			v = [][3]string{{fields[0], fields[3], fields[4]}}
 			detailDistributionMap[key] = v
 		}
 	}
