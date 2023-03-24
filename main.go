@@ -2,6 +2,7 @@ package main
 
 import (
 	"bitbucket.org/ai69/popua"
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -43,6 +44,7 @@ const (
 
 	schoolPTBURLFormat = "https://static-data.gaokao.cn/www/2.0/school/%v/dic/provincescore.json"
 	schoolPTBRawDir    = "school_ptb"
+	schoolPTBFile      = "ptb.txt"
 
 	// year, school id, province id, type, batch, index
 	specialDetailURLFormat = "https://static-data.gaokao.cn/www/2.0/schoolspecialindex/%v/%v/%v/%v/%v/%v.json"
@@ -137,13 +139,29 @@ func main() {
 	wg.Wait()
 	close(schoolPTBCollectorCh)
 	collectorWG.Wait()
+	// ptb info may fail: 71
 
-	//// 4. detail
-	//// have to read from file.
-	//// [year,school,province] -> [[type,batch], [type,batch]...]
-	//detailDistributionMap := make(map[[3]string][2]string)
-	//// when generate, generate by year-school-province group
-
+	// 4. detail
+	// have to read from file. should be 433381 lines
+	// [year,school,province] -> [[type,batch], [type,batch]...]
+	detailDistributionMap := make(map[[3]string][][2]string)
+	// when generate, generate by year-school-province group
+	ptbFile, err := os.Open(schoolPTBFile)
+	if err != nil {
+		log.Fatalw("open ptb list failed", zap.Error(err))
+	}
+	scanner := bufio.NewScanner(ptbFile)
+	for scanner.Scan() {
+		// year, school, prov, type, batch
+		fields := strings.Split(scanner.Text(), ",")
+		key := [3]string{fields[0], fields[1], fields[2]}
+		if v, ok := detailDistributionMap[key]; ok {
+			v = append(v, [2]string{fields[3], fields[4]})
+		} else {
+			v = [][2]string{{fields[3], fields[4]}}
+		}
+	}
+	log.Infof("detail group: %v", len(detailDistributionMap))
 }
 
 func specialDetailWorker(idCh chan string, wg *sync.WaitGroup) {
@@ -172,7 +190,7 @@ func specialDetailWorker(idCh chan string, wg *sync.WaitGroup) {
 
 func schoolPTBCollector(collectorCh chan string, wg *sync.WaitGroup) {
 	defer wg.Done()
-	f, err := os.OpenFile("ptb.txt", os.O_CREATE|os.O_RDWR, 0666)
+	f, err := os.OpenFile(schoolPTBFile, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		panic(err)
 	}
